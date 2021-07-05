@@ -77,7 +77,7 @@ SAFEAPI kuint32 kit_get_error();
 SAFEAPI kcstring kit_human_error();
 ```
 
-## Unsafe api
+## Unsafe API
 
 Below the list of unsafe api
 

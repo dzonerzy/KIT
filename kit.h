@@ -175,6 +175,7 @@ typedef enum _kit_error {
 	KIT_SHARED_SECRET_GENERATION_FAILED = 0x800B,
 	KIT_KDF_FAILED = 0x800C,
 	KIT_INITIALIZATION_FAILED = 0x800D,
+	KIT_CRYPTO_ERROR = 0x800E,
 } kit_error;
 
 typedef struct _kit_packet_header {
@@ -667,7 +668,7 @@ static void inv_sub_bytes(state_t* state) {
 }
 
 static void inv_shift_rows(state_t* state) {
-	kuint8 temp; 
+	kuint8 temp;
 	temp = (*state)[3][1];
 	(*state)[3][1] = (*state)[2][1];
 	(*state)[2][1] = (*state)[1][1];
@@ -768,12 +769,12 @@ ksize AES_pkcs7_unpad_size(kbinary* buf, ksize size) {
 
 kbinary* AES_pkcs7_pad(kbinary* buf, ksize size) {
 	ksize pad_size = AES_pkcs7_pad_size(size);
-	kbinary* padded = (kbinary * )malloc(pad_size + 1);
+	kbinary* padded = (kbinary*)malloc(pad_size + 1);
 	ksize pad_value = AES_pkcs7_pad_value(size);
 	memset(padded, 0, pad_size + 1);
 	memcpy(padded, buf, size);
 	for (int i = 0; i < pad_value; i++)
-		padded[size+i] = (kbinary)pad_value;
+		padded[size + i] = (kbinary)pad_value;
 	return padded;
 }
 
@@ -1165,11 +1166,23 @@ typedef union {
 }
 CSPRNG_TYPE;
 
-kptr csprng_create() {
-	CSPRNG_TYPE csprng;
-	if (!CryptAcquireContextA(&csprng.hCryptProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT))
-		csprng.hCryptProv = 0;
-	return csprng.object;
+CSPRNG_TYPE* csprng_create() {
+	CSPRNG_TYPE* csprng = (CSPRNG_TYPE*)malloc(sizeof(CSPRNG_TYPE));
+	if (csprng != NULL) {
+		csprng->object = NULL;
+		if (!CryptAcquireContextA(&csprng->hCryptProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT))
+			csprng->hCryptProv = 0;
+		return csprng;
+	}
+	return KNULL;
+}
+
+kbool csprng_delete(CSPRNG_TYPE* c) {
+	if (CryptReleaseContext(c->hCryptProv, 0)) {
+		free(c);
+		return KTRUE;
+	}
+	return KFALSE;
 }
 
 int csprng_get(kptr object, void* dest, unsigned long long size) {
@@ -1622,10 +1635,17 @@ kbool kit_make_packet(IN kit_packet_type ptype, IN kit_data_type dtype, IN kit_p
 	else {
 		packet->header.crc32 = -1;
 	}
-	kptr csprng = csprng_create();
+	CSPRNG_TYPE* csprng = csprng_create();
 	if (!csprng)
 		return KFALSE;
-	packet->header.pid = csprng_get_int(csprng) % 0xFFFF;
+	packet->header.pid = csprng_get_int(csprng->object) % 0xFFFF;
+	while (packet->header.pid == kit_last_pid) {
+		packet->header.pid = csprng_get_int(csprng->object) % 0xFFFF;
+	}
+	if (!csprng_delete(csprng)) {
+		kit_set_error(KIT_CRYPTO_ERROR);
+		return KFALSE;
+	}
 	kit_last_pid = packet->header.pid;
 	kit_set_error(KIT_OK);
 	return KTRUE;
@@ -1857,11 +1877,15 @@ kbool kit_listen_and_accept(IN pkinstance instance) {
 }
 
 kbool kit_fill_secure_random(IN kptr buffer, IN ksize size) {
-	kptr csprng = csprng_create();
+	CSPRNG_TYPE* csprng = csprng_create();
 	if (!csprng)
 		return KFALSE;
 	for (int i = 0; i < size; i++)
-		((kuint8*)(buffer))[i] = csprng_get_int(csprng) % 0xFF;
+		((kuint8*)(buffer))[i] = csprng_get_int(csprng->object) % 0xFF;
+	if (!csprng_delete(csprng)) {
+		kit_set_error(KIT_CRYPTO_ERROR);
+		return KFALSE;
+	}
 	return KTRUE;
 }
 
@@ -1905,6 +1929,8 @@ kcstring kit_human_error() {
 		return "key derivation function failed";
 	case KIT_INITIALIZATION_FAILED:
 		return "error initialize failed";
+	case KIT_CRYPTO_ERROR:
+		return "error during crypto initialize/finalize";
 	default:
 		return "unknown error";
 	}
@@ -1938,7 +1964,7 @@ kvoid kit_encrypt_packet(IN pkinstance instance, IN pkpacket pkt) {
 		memcpy(pkt->body.bindata, randomIV, sizeof(randomIV));
 		memcpy(pkt->body.bindata + sizeof(randomIV), padded, padded_size);
 		pkt->body.length = padded_size + sizeof(randomIV);
-		AES_CBC_encrypt_buffer(&instance->aes, pkt->body.bindata + sizeof(randomIV), pkt->body.length);
+		AES_CBC_encrypt_buffer(&instance->aes, pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
 		free(padded);
 		pkt->header.crc32 = kit_crc32(pkt->body.bindata, pkt->body.length);
 		ReleaseMutex(kit_global_mutex);
@@ -1957,7 +1983,7 @@ kvoid kit_decrypt_packet(IN pkinstance instance, IN pkpacket pkt) {
 		AES_init_ctx_iv(&instance->aes, instance->sharedSecret, randomIV);
 		AES_CBC_decrypt_buffer(&instance->aes, pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
 		ksize unpadded_size = AES_pkcs7_unpad_size(pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
-		kbinary* unpadded = AES_pkcs7_unpad(pkt->body.bindata + sizeof(randomIV) , pkt->body.length - sizeof(randomIV));
+		kbinary* unpadded = AES_pkcs7_unpad(pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
 		memset(pkt->body.bindata, 0, sizeof(pkt->body.bindata));
 		memcpy(pkt->body.bindata, unpadded, unpadded_size);
 		pkt->body.length = unpadded_size;
@@ -1996,18 +2022,27 @@ kbool kit_write(IN pkinstance instance, IN kbinary* data, ksize length) {
 }
 
 pkpacket kit_read(IN pkinstance instance) {
-	pkpacket pkt = (pkpacket)malloc(sizeof(kpacket));
+	pkpacket pkt;
 	while (KTRUE) {
-		if (!kit_read_packet(instance, pkt)) {
-			free(pkt);
-			return KNULL;
-		}
-		if (pkt->header.type == KIT_TYPE_DATA && pkt->header.flags == KIT_FLAG_DEFAULT && pkt->body.datatype == KIT_DATA_BINARY) {
-			kit_decrypt_packet(instance, pkt);
-		}
-		if (!pkt->header.readed && pkt->header.pid != kit_last_pid) {
-			kit_set_read(instance);
-			break;
+		pkt = (pkpacket)malloc(sizeof(kpacket));
+		if (pkt != NULL) {
+			if (!kit_read_packet(instance, pkt)) {
+				free(pkt);
+				return KNULL;
+			}
+			else {
+				if (pkt->header.type == KIT_TYPE_DATA && pkt->header.flags == KIT_FLAG_DEFAULT && pkt->body.datatype == KIT_DATA_BINARY) {
+					kit_decrypt_packet(instance, pkt);
+				}
+				if (!pkt->header.readed && pkt->header.pid != kit_last_pid) {
+					kit_last_pid = pkt->header.pid;
+					kit_set_read(instance);
+					break;
+				}
+				else {
+					free(pkt);
+				}
+			}
 		}
 	}
 	return pkt;
@@ -2036,7 +2071,7 @@ kvoid kit_set_read(IN pkinstance instance) {
 }
 
 kit_action kit_select(IN pkinstance instance) {
-	kpacket pkt = { 0 };
+	kpacket pkt;
 	while (!kit_read_packet(instance, &pkt)) { Sleep(10); }
 	if (!pkt.header.readed && pkt.header.pid != kit_last_pid) {
 		return KIT_CAN_READ;

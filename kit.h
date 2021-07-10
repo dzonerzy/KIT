@@ -133,6 +133,7 @@ typedef enum _kit_packet_type {
 typedef enum _kit_action {
 	KIT_CAN_READ = 1,
 	KIT_CAN_WRITE = 2,
+	KIT_WAIT = 3,
 } kit_action;
 
 typedef enum _kit_data_type {
@@ -2072,10 +2073,16 @@ kvoid kit_set_read(IN pkinstance instance) {
 
 kit_action kit_select(IN pkinstance instance) {
 	kpacket pkt;
-	while (!kit_read_packet(instance, &pkt)) { Sleep(10); }
-	if (!pkt.header.readed && pkt.header.pid != kit_last_pid) {
-		return KIT_CAN_READ;
+	if (kit_read_packet(instance, &pkt)) {
+		if (!pkt.header.readed && pkt.header.pid != kit_last_pid) {
+			return KIT_CAN_READ;
+		}
+		else if (pkt.header.readed && pkt.header.pid != kit_last_pid) {
+			return KIT_CAN_WRITE;
+		}
 	}
-	return KIT_CAN_WRITE;
+	else {
+		return KIT_WAIT;
+	}
 }
 #endif

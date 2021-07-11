@@ -27,6 +27,7 @@
 #ifdef _MSC_VER
 #pragma comment(lib, "advapi32.lib")
 #endif
+#include <corecrt_malloc.h>
 
 #pragma once
 #define SAFEAPI
@@ -242,7 +243,6 @@ UNSAFEAPI kvoid kit_set_error(IN kit_error errid);
 UNSAFEAPI kuint32 kit_crc32(IN kptr data, IN ksize datasize);
 UNSAFEAPI kbool kit_fill_secure_random(IN kptr buffer, IN ksize size);
 
-const kuint32 crc32_tab[];
 static khandle kit_global_mutex;
 static kshort kit_last_pid;
 
@@ -1740,7 +1740,7 @@ kbool kit_connect(IN kcstring id, OUT pkinstance instance) {
 		kit_set_error(KIT_CONNECT_FAILED);
 		return KFALSE;
 	}
-	kptr hMap = MapViewOfFile(hFile, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, instance->size);
+	kptr hMap = MapViewOfFile(hFile, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, sizeof(kpacket));
 	if (!hMap) {
 		kit_set_error(KIT_ERR_MAP_VIEW_OF_FILE);
 		return KFALSE;
@@ -1956,12 +1956,14 @@ kbool kit_init() {
 kvoid kit_encrypt_packet(IN pkinstance instance, IN pkpacket pkt) {
 	kuint32 mutex_status = WaitForSingleObject(kit_global_mutex, KIT_WAIT_MUTEX);
 	kuint8 randomIV[16];
+	kbinary* padded;
+	ksize padded_size;
 	switch (mutex_status) {
 	case WAIT_OBJECT_0:
 		kit_fill_secure_random(randomIV, sizeof(randomIV));
 		AES_init_ctx_iv(&instance->aes, instance->sharedSecret, randomIV);
-		ksize padded_size = AES_pkcs7_pad_size(pkt->body.length);
-		kbinary* padded = AES_pkcs7_pad(pkt->body.bindata, pkt->body.length);
+		padded_size = AES_pkcs7_pad_size(pkt->body.length);
+		padded = AES_pkcs7_pad(pkt->body.bindata, pkt->body.length);
 		memcpy(pkt->body.bindata, randomIV, sizeof(randomIV));
 		memcpy(pkt->body.bindata + sizeof(randomIV), padded, padded_size);
 		pkt->body.length = padded_size + sizeof(randomIV);
@@ -1978,13 +1980,15 @@ kvoid kit_encrypt_packet(IN pkinstance instance, IN pkpacket pkt) {
 kvoid kit_decrypt_packet(IN pkinstance instance, IN pkpacket pkt) {
 	kuint32 mutex_status = WaitForSingleObject(kit_global_mutex, KIT_WAIT_MUTEX);
 	kuint8 randomIV[16];
+	kbinary* unpadded;
+	ksize unpadded_size;
 	switch (mutex_status) {
 	case WAIT_OBJECT_0:
 		memcpy(randomIV, pkt->body.bindata, sizeof(randomIV));
 		AES_init_ctx_iv(&instance->aes, instance->sharedSecret, randomIV);
 		AES_CBC_decrypt_buffer(&instance->aes, pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
-		ksize unpadded_size = AES_pkcs7_unpad_size(pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
-		kbinary* unpadded = AES_pkcs7_unpad(pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
+		unpadded_size = AES_pkcs7_unpad_size(pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
+		unpadded = AES_pkcs7_unpad(pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
 		memset(pkt->body.bindata, 0, sizeof(pkt->body.bindata));
 		memcpy(pkt->body.bindata, unpadded, unpadded_size);
 		pkt->body.length = unpadded_size;

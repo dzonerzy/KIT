@@ -32,14 +32,16 @@
 #pragma once
 #define SAFEAPI
 #define UNSAFEAPI
+#define KIT_MAX_CLIENTS 1024
 #define KIT_MAX_DATA_SIZE 4096
+#define KIT_FAIL -1
 #define KFALSE 0
 #define KTRUE 1
 #define KNULL 0
-#define KIT_DEFAULT_IV (kbinary*)"\xA0\xA1\xDD\xC0\xFE\x42\x77\x8D\xC0\xFF\x2A\x3C\x8A\x45\xCC\xD0"
 #define KIT_WAIT_MUTEX 3000
 #define KIT_MUTEX (kstring*)"Local\\KIT_M"
 #define KIT_DEFAULT_ID (kstring *)"Local\\KIT"
+#define KIT_DEFAULT_TIMEOUT 5000
 #define KSALT (kbinary *)"KIT"
 #define KSALT_LENGTH 3
 #define DH_KEY_LENGTH 16
@@ -113,6 +115,7 @@ typedef unsigned int kuint32;
 typedef unsigned char kuint8;
 typedef void kvoid;
 typedef unsigned long long kuint64;
+typedef kuint8 ksharedsecret[20];
 
 typedef union _kuint128 {
 	struct {
@@ -171,20 +174,23 @@ typedef enum _kit_error {
 	KIT_INVALID_PARAMETER = 0x8005,
 	KIT_CONNECT_FAILED = 0x8006,
 	KIT_MEMORY_READ_ERROR = 0x8007,
-	KIT_SERVER_NOT_AVAILABLE = 0x8008,
+	KIT_TIMEOUT_ERROR = 0x8008,
 	KIT_KEY_GENERATION_FAILED = 0x8009,
 	KIT_PACKET_MISMATCH_CRC32 = 0x800A,
 	KIT_SHARED_SECRET_GENERATION_FAILED = 0x800B,
 	KIT_KDF_FAILED = 0x800C,
 	KIT_INITIALIZATION_FAILED = 0x800D,
 	KIT_CRYPTO_ERROR = 0x800E,
+	KIT_MEMORY_RESIZE_ERROR = 0x800F,
+	KIT_TIMER_ERROR = 0x8010,
+	KIT_NO_MORE_SLOT = 0x8011,
 } kit_error;
 
 typedef struct _kit_packet_header {
 	kit_packet_flags flags;
 	kit_packet_type type;
 	kuint32 crc32;
-	kshort pid;
+	kshort senderid;
 	kptr dataptr;
 	kuint8 readed;
 } kpacket_header, * pkpacket_header;
@@ -218,9 +224,15 @@ typedef struct _kit_instance {
 	khandle hFile;
 	kptr hMap;
 	ksize size;
-	kuint8 sharedSecret[20];
 	AES_ctx aes;
-} kinstance, * pkinstance;
+	kuint32 id;
+	ksharedsecret* sharedSecret;
+} kinstance, *pkinstance;
+
+typedef struct _kit_client_info {
+	kinstance instance;
+	kuint32 clientid;
+}kclientinfo, *pkclientinfo;
 
 SAFEAPI kbool kit_init();
 SAFEAPI kbool kit_bind(IN kcstring id, OUT pkinstance instance);
@@ -229,22 +241,28 @@ SAFEAPI kbool kit_disconnect(IN pkinstance instance);
 SAFEAPI pkpacket kit_read(IN pkinstance instance);
 SAFEAPI kbool kit_write(IN pkinstance instance, IN kbinary* data, ksize length);
 SAFEAPI kbool kit_connect(IN kcstring id, OUT pkinstance instance);
-SAFEAPI kbool kit_listen_and_accept(IN pkinstance instance);
+SAFEAPI pkclientinfo kit_listen_and_accept(IN pkinstance instance);
 SAFEAPI kuint32 kit_get_error();
 SAFEAPI kcstring kit_human_error();
+SAFEAPI kvoid kit_notify_disconnect(pkclientinfo clientinfo);
+SAFEAPI kbool kit_is_disconnect(pkpacket pkt);
 UNSAFEAPI kvoid kit_set_read(IN pkinstance instance);
 UNSAFEAPI kvoid kit_decrypt_packet(IN pkinstance instance, IN pkpacket pkt);
 UNSAFEAPI kvoid kit_encrypt_packet(IN pkinstance instance, IN pkpacket pkt);
 UNSAFEAPI kbool kit_client_handshake(IN pkinstance instance);
 UNSAFEAPI kbool kit_read_packet(IN pkinstance instance, OUT pkpacket pkt);
 UNSAFEAPI kbool kit_write_packet(IN pkinstance instance, IN pkpacket packet);
-UNSAFEAPI kbool kit_make_packet(IN kit_packet_type ptype, IN kit_data_type dtype, IN kit_packet_flags flags, IN ksize datasize, IN kptr data, OUT pkpacket packet);
+UNSAFEAPI kbool kit_make_packet(IN pkinstance instance, IN kit_packet_type ptype, IN kit_data_type dtype, IN kit_packet_flags flags, IN ksize datasize, IN kptr data, OUT pkpacket packet);
 UNSAFEAPI kvoid kit_set_error(IN kit_error errid);
 UNSAFEAPI kuint32 kit_crc32(IN kptr data, IN ksize datasize);
 UNSAFEAPI kbool kit_fill_secure_random(IN kptr buffer, IN ksize size);
+UNSAFEAPI kvoid kit_timeout(IN PVOID lpParameter, IN BOOLEAN TimerOrWaitFired);
+UNSAFEAPI kuint8 kit_get_slot();
+UNSAFEAPI kvoid kit_free_slot(kuint8 slot);
 
 static khandle kit_global_mutex;
-static kshort kit_last_pid;
+static kuint8 kit_clients[KIT_MAX_CLIENTS] = { 0 };
+//static kuint32 kit_client_num;
 
 #ifndef KIT_MULTIPLE_IMPORT
 #define KIT_MULTIPLE_IMPORT
@@ -1169,6 +1187,7 @@ CSPRNG_TYPE;
 
 CSPRNG_TYPE* csprng_create() {
 	CSPRNG_TYPE* csprng = (CSPRNG_TYPE*)malloc(sizeof(CSPRNG_TYPE));
+	memset(csprng, 0, sizeof(CSPRNG_TYPE));
 	if (csprng != NULL) {
 		csprng->object = NULL;
 		if (!CryptAcquireContextA(&csprng->hCryptProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT))
@@ -1609,6 +1628,19 @@ const kuint32 crc32_tab[] = {
 	0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d
 };
 
+kbool kit_is_disconnect(pkpacket pkt) {
+	if (pkt->header.type == KIT_TYPE_DISCONNECT && pkt->header.flags == KIT_FLAG_DISCONNECTED) {
+		free(pkt);
+		return KTRUE;
+	}
+	return KFALSE;
+}
+
+kvoid kit_notify_disconnect(pkclientinfo clientinfo) {
+	kit_free_slot(clientinfo->clientid);
+	memset(clientinfo->instance.hMap, 0, sizeof(kpacket));
+}
+
 kuint32 kit_crc32(IN kptr data, IN ksize datasize) {
 	const kbinary* p = (kbinary*)data;
 	kuint32 crc;
@@ -1618,7 +1650,7 @@ kuint32 kit_crc32(IN kptr data, IN ksize datasize) {
 	return crc ^ ~0U;
 }
 
-kbool kit_make_packet(IN kit_packet_type ptype, IN kit_data_type dtype, IN kit_packet_flags flags, IN ksize datasize, IN kptr data, OUT pkpacket packet) {
+kbool kit_make_packet(IN pkinstance instance, IN kit_packet_type ptype, IN kit_data_type dtype, IN kit_packet_flags flags, IN ksize datasize, IN kptr data, OUT pkpacket packet) {
 	memset(packet, 0, sizeof(kpacket));
 	packet->header.type = ptype;
 	if (flags & KIT_FLAG_RESERVED1 || flags & KIT_FLAG_RESERVED2 || flags & KIT_FLAG_RESERVED3 || flags & KIT_FLAG_RESERVED4) {
@@ -1627,6 +1659,9 @@ kbool kit_make_packet(IN kit_packet_type ptype, IN kit_data_type dtype, IN kit_p
 	}
 	packet->header.flags = (kit_packet_flags)(flags - (flags & ~(KIT_FLAG_DEFAULT | KIT_FLAG_BINDED | KIT_FLAG_CLOSED | KIT_FLAG_CONNECTED | KIT_FLAG_ACCEPTED | KIT_FLAG_CLIENT_HANDSHAKE | KIT_FLAG_SERVER_HANDSHAKE | KIT_FLAG_DISCONNECTED)));
 	if (dtype != KIT_DATA_NONE) {
+		if (datasize > sizeof(packet->body.bindata)) {
+			datasize = sizeof(packet->body.bindata);
+		}
 		packet->body.length = datasize;
 		packet->body.datatype = dtype;
 		packet->header.dataptr = (kptr)memcpy(packet->body.bindata, data, datasize);
@@ -1636,18 +1671,7 @@ kbool kit_make_packet(IN kit_packet_type ptype, IN kit_data_type dtype, IN kit_p
 	else {
 		packet->header.crc32 = -1;
 	}
-	CSPRNG_TYPE* csprng = csprng_create();
-	if (!csprng)
-		return KFALSE;
-	packet->header.pid = csprng_get_int(csprng->object) % 0xFFFF;
-	while (packet->header.pid == kit_last_pid) {
-		packet->header.pid = csprng_get_int(csprng->object) % 0xFFFF;
-	}
-	if (!csprng_delete(csprng)) {
-		kit_set_error(KIT_CRYPTO_ERROR);
-		return KFALSE;
-	}
-	kit_last_pid = packet->header.pid;
+	packet->header.senderid = instance->id;
 	kit_set_error(KIT_OK);
 	return KTRUE;
 }
@@ -1661,8 +1685,7 @@ kbool kit_write_packet(IN pkinstance instance, IN pkpacket packet) {
 		if (!ret) {
 			kit_set_error(KIT_ERR_WRITE_MAP);
 		}
-		SetFilePointer(instance->hFile, 0, 0, FILE_BEGIN);
-		ret = ret && FlushViewOfFile(instance->hMap, 0x1000);
+		ret = ret && FlushViewOfFile(instance->hMap, instance->size);
 		if (ret)
 			kit_set_error(KIT_OK);
 		ReleaseMutex(kit_global_mutex);
@@ -1676,27 +1699,29 @@ kbool kit_write_packet(IN pkinstance instance, IN pkpacket packet) {
 }
 
 kbool kit_bind(IN kcstring id, OUT pkinstance instance) {
-	khandle hFile = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(kpacket), id);
+	khandle hFile = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_RESERVE, 0, sizeof(kpacket) * KIT_MAX_CLIENTS, id);
 	if (!hFile) {
 		kit_set_error(KIT_ERR_CREATE_FILE_MAPPING);
 		return KFALSE;
 	}
-	kptr hMap = MapViewOfFile(hFile, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, sizeof(kpacket));
+	kptr hMap = MapViewOfFile(hFile, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, 0);
 	if (!hMap) {
 		kit_set_error(KIT_ERR_MAP_VIEW_OF_FILE);
 		return KFALSE;
 	}
-	MEMORY_BASIC_INFORMATION mbi;
-	VirtualQuery(hMap, &mbi, sizeof(kpacket));
-	if (!instance) {
-		kit_set_error(KIT_INVALID_PARAMETER);
-		return KFALSE;
-	}
 	instance->hFile = hFile;
 	instance->hMap = hMap;
-	instance->size = mbi.RegionSize;
+	instance->size = sizeof(kpacket);
+	instance->sharedSecret = (ksharedsecret*)malloc(sizeof(ksharedsecret) * KIT_MAX_CLIENTS);
+	instance->id = 0;
+	kit_clients[instance->id] = 1;
+	memset(instance->sharedSecret, 0, sizeof(ksharedsecret) * KIT_MAX_CLIENTS);
 	kpacket pkt;
-	if (!kit_make_packet(KIT_TYPE_BIND, KIT_DATA_NONE, KIT_FLAG_BINDED, 0, 0, &pkt) == KTRUE) {
+	if (!VirtualAlloc(instance->hMap, sizeof(kpacket), MEM_COMMIT, PAGE_READWRITE)) {
+		kit_set_error(KIT_MEMORY_RESIZE_ERROR);
+		return KFALSE;
+	}
+	if (!kit_make_packet(instance, KIT_TYPE_BIND, KIT_DATA_NONE, KIT_FLAG_BINDED, 0, 0, &pkt) == KTRUE) {
 		kit_set_error(KIT_BIND_FAILED);
 		return KFALSE;
 	}
@@ -1713,7 +1738,6 @@ kbool kit_read_packet(IN pkinstance instance, OUT pkpacket pkt) {
 	case WAIT_OBJECT_0:
 		memset(pkt, 0, sizeof(kpacket));
 		if (memcpy(pkt, instance->hMap, sizeof(kpacket))) {
-			SetFilePointer(instance->hFile, 0, 0, FILE_BEGIN);
 			if (pkt->header.type == KIT_TYPE_HANDSHAKE || pkt->header.type == KIT_TYPE_DATA) {
 				if (pkt->body.datatype != KIT_DATA_NONE) {
 					if (pkt->header.crc32 != kit_crc32(pkt->body.bindata, pkt->body.length)) {
@@ -1734,35 +1758,54 @@ kbool kit_read_packet(IN pkinstance instance, OUT pkpacket pkt) {
 	}
 }
 
+kvoid kit_timeout(IN PVOID lpParameter, IN BOOLEAN TimerOrWaitFired) {
+	if (TimerOrWaitFired) {
+		*(kbool*)lpParameter = KTRUE;
+	}
+}
+
 kbool kit_connect(IN kcstring id, OUT pkinstance instance) {
 	khandle hFile = OpenFileMappingA(FILE_MAP_WRITE | FILE_MAP_READ, FALSE, id);
 	if (!hFile) {
 		kit_set_error(KIT_CONNECT_FAILED);
 		return KFALSE;
 	}
-	kptr hMap = MapViewOfFile(hFile, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, sizeof(kpacket));
+	kptr hMap = MapViewOfFile(hFile, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, 0);
 	if (!hMap) {
 		kit_set_error(KIT_ERR_MAP_VIEW_OF_FILE);
 		return KFALSE;
 	}
-	MEMORY_BASIC_INFORMATION mbi;
-	VirtualQuery(hMap, &mbi, sizeof(kpacket));
-	if (!instance) {
-		kit_set_error(KIT_INVALID_PARAMETER);
-		return KFALSE;
-	}
 	instance->hFile = hFile;
 	instance->hMap = hMap;
-	instance->size = mbi.RegionSize;
+	instance->size = sizeof(kpacket);
+	instance->sharedSecret = (ksharedsecret*)malloc(sizeof(ksharedsecret));
 	kpacket pkt;
-	if (!kit_read_packet(instance, &pkt)) {
+	kbool timeout = KFALSE;
+	khandle hTimer = NULL;
+	if (!CreateTimerQueueTimer(&hTimer, NULL, (WAITORTIMERCALLBACK)kit_timeout, &timeout, KIT_DEFAULT_TIMEOUT, 0, WT_EXECUTEDEFAULT)) {
+		kit_set_error(KIT_TIMER_ERROR);
 		return KFALSE;
 	}
-	if (pkt.header.flags != KIT_TYPE_BIND && pkt.header.flags != KIT_FLAG_BINDED) {
-		kit_set_error(KIT_SERVER_NOT_AVAILABLE);
+	while (KTRUE) {
+		if (!kit_read_packet(instance, &pkt)) {
+			return KFALSE;
+		}
+		if (pkt.header.type == KIT_TYPE_BIND && pkt.header.flags == KIT_FLAG_BINDED) {
+			break;
+		}
+		if (timeout) {
+			break;
+		}
+	}
+	if (!DeleteTimerQueueTimer(NULL, hTimer, NULL)) {
+		kit_set_error(KIT_TIMER_ERROR);
 		return KFALSE;
 	}
-	if (!kit_make_packet(KIT_TYPE_CONNECT, KIT_DATA_NONE, KIT_FLAG_CLIENT_HANDSHAKE, 0, 0, &pkt) || !kit_write_packet(instance, &pkt)) {
+	if (timeout) {
+		kit_set_error(KIT_TIMEOUT_ERROR);
+		return KFALSE;
+	}
+	if (!kit_make_packet(instance, KIT_TYPE_CONNECT, KIT_DATA_NONE, KIT_FLAG_CLIENT_HANDSHAKE, 0, 0, &pkt) || !kit_write_packet(instance, &pkt)) {
 		return KFALSE;
 	}
 	return kit_client_handshake(instance);
@@ -1774,107 +1817,252 @@ kbool kit_client_handshake(IN pkinstance instance) {
 	kuint8 server_public[ECC_PUB_KEY_SIZE];
 	kuint8 shared_secret[ECC_PUB_KEY_SIZE];
 	kpacket pkt;
+	kbool timeout = KFALSE;
+	khandle hTimer = NULL;
+	if (!CreateTimerQueueTimer(&hTimer, NULL, (WAITORTIMERCALLBACK)kit_timeout, &timeout, KIT_DEFAULT_TIMEOUT, 0, WT_EXECUTEDEFAULT)) {
+		kit_set_error(KIT_TIMER_ERROR);
+		return KFALSE;
+	}
 	while (KTRUE) {
+		if (timeout) {
+			goto fail;
+		}
 		if (!kit_read_packet(instance, &pkt)) {
-			return KFALSE;
+			goto fail;
 		}
 		if (pkt.header.type == KIT_TYPE_HANDSHAKE && pkt.header.flags == KIT_FLAG_SERVER_HANDSHAKE) {
 			if (pkt.header.dataptr) {
 				memcpy(server_public, pkt.body.bindata, pkt.body.length);
 				if (!kit_fill_secure_random(client_private, ECC_PRV_KEY_SIZE)) {
 					kit_set_error(KIT_KEY_GENERATION_FAILED);
-					return KFALSE;
+					goto fail;
 				}
 				if (!ecdh_generate_keys(client_public, client_private)) {
 					kit_set_error(KIT_KEY_GENERATION_FAILED);
-					return KFALSE;
+					goto fail;
 				}
-				if (!kit_make_packet(KIT_TYPE_HANDSHAKE, KIT_DATA_BINARY, KIT_FLAG_CLIENT_HANDSHAKE, ECC_PUB_KEY_SIZE, client_public, &pkt) || !kit_write_packet(instance, &pkt)) {
+				if (!kit_make_packet(instance, KIT_TYPE_HANDSHAKE, KIT_DATA_BINARY, KIT_FLAG_CLIENT_HANDSHAKE, ECC_PUB_KEY_SIZE, client_public, &pkt) || !kit_write_packet(instance, &pkt)) {
 					kit_set_error(KIT_ERR_CREATE_PACKET);
-					return KFALSE;
+					goto fail;
 				}
 				if (!ecdh_shared_secret(client_private, server_public, shared_secret)) {
 					kit_set_error(KIT_SHARED_SECRET_GENERATION_FAILED);
-					return KFALSE;
+					goto fail;
 				}
-				if (hkdf(SHA1, NULL, 0, shared_secret, ECC_PUB_KEY_SIZE, KSALT, KSALT_LENGTH, instance->sharedSecret, SHA1HashSize) != 0) {
+				if (hkdf(SHA1, NULL, 0, shared_secret, ECC_PUB_KEY_SIZE, KSALT, KSALT_LENGTH, (kuint8 *)instance->sharedSecret, SHA1HashSize) != 0) {
 					kit_set_error(KIT_KDF_FAILED);
-					return KFALSE;
+					goto fail;
 				}
 				break;
 			}
 		}
 	}
 	while (KTRUE) {
+		if (timeout) {
+			goto fail;
+		}
 		if (!kit_read_packet(instance, &pkt)) {
-			return KFALSE;
+			goto fail;
 		}
 		if (pkt.header.type == KIT_TYPE_ACCEPT && pkt.header.flags == KIT_FLAG_ACCEPTED) {
-			if (!kit_make_packet(KIT_TYPE_CONNECT, KIT_DATA_NONE, KIT_FLAG_CONNECTED, 0, 0, &pkt) || !kit_write_packet(instance, &pkt)) {
-				return KFALSE;
-			}
-			else {
-				return KTRUE;
-			}
-		}
-	}
-}
-
-kbool kit_listen_and_accept(IN pkinstance instance) {
-	kuint8 server_private[ECC_PRV_KEY_SIZE];
-	kuint8 server_public[ECC_PUB_KEY_SIZE];
-	kuint8 client_public[ECC_PUB_KEY_SIZE];
-	kuint8 shared_secret[ECC_PUB_KEY_SIZE];
-	kpacket pkt;
-	while (KTRUE) {
-		if (!kit_read_packet(instance, &pkt)) {
-			return KFALSE;
-		}
-		if (pkt.header.type == KIT_TYPE_CONNECT && pkt.header.flags == KIT_FLAG_CLIENT_HANDSHAKE) {
-			if (!kit_fill_secure_random(server_private, ECC_PRV_KEY_SIZE)) {
-				kit_set_error(KIT_KEY_GENERATION_FAILED);
-				return KFALSE;
-			}
-			if (!ecdh_generate_keys(server_public, server_private)) {
-				kit_set_error(KIT_KEY_GENERATION_FAILED);
-				return KFALSE;
-			}
-			if (!kit_make_packet(KIT_TYPE_HANDSHAKE, KIT_DATA_BINARY, KIT_FLAG_SERVER_HANDSHAKE, ECC_PUB_KEY_SIZE, server_public, &pkt) || !kit_write_packet(instance, &pkt)) {
-				return KFALSE;
+			if (!kit_make_packet(instance, KIT_TYPE_CONNECT, KIT_DATA_NONE, KIT_FLAG_CONNECTED, 0, 0, &pkt) || !kit_write_packet(instance, &pkt)) {
+				goto fail;
 			}
 			break;
 		}
 	}
 	while (KTRUE) {
+		if (timeout) {
+			goto fail;
+		}
 		if (!kit_read_packet(instance, &pkt)) {
-			return KFALSE;
+			goto fail;
+		}
+		if (pkt.header.type == KIT_TYPE_CONNECT && pkt.header.flags == KIT_FLAG_CONNECTED) {
+			if (pkt.body.datatype == KIT_DATA_BINARY) {
+				instance->id = *(kuint32*)(pkt.body.bindata);
+				kit_set_read(instance);
+				instance->hMap = (kptr)((kuint64)instance->hMap + (instance->size * instance->id ));
+				if (!DeleteTimerQueueTimer(NULL, hTimer, NULL)) {
+					kit_set_error(KIT_TIMER_ERROR);
+					return KNULL;
+				}
+				return KTRUE;
+			}
+		}
+	}
+fail:
+	if (!DeleteTimerQueueTimer(NULL, hTimer, NULL)) {
+		kit_set_error(KIT_TIMER_ERROR);
+		return KNULL;
+	}
+	if (timeout) {
+		kit_set_error(KIT_TIMEOUT_ERROR);
+	}
+	return KFALSE;
+}
+
+kuint8 kit_get_slot() {
+	for (int i = 1; i < sizeof(kit_clients); i++) {
+		if (kit_clients[i] == 0) {
+			kit_clients[i] = 1;
+			return i;
+		}
+	}
+	return -1;
+}
+
+kvoid kit_free_slot(kuint8 slot) {
+	kit_clients[slot] = 0;
+}
+
+pkclientinfo kit_listen_and_accept(IN pkinstance instance) {
+	kuint8 server_private[ECC_PRV_KEY_SIZE];
+	kuint8 server_public[ECC_PUB_KEY_SIZE];
+	kuint8 client_public[ECC_PUB_KEY_SIZE];
+	kuint8 shared_secret[ECC_PUB_KEY_SIZE];
+	kpacket pkt;
+	pkclientinfo info = (pkclientinfo)malloc(sizeof(kclientinfo));
+	kbool timeout = KFALSE;
+	khandle hTimer = NULL;
+	kuint8 slot = -1;
+	while (KTRUE) {
+		if (timeout) {
+			goto fail;
+		}
+		if (!kit_read_packet(instance, &pkt)) {
+			goto fail;
+		}
+		if (pkt.header.type == KIT_TYPE_CONNECT && pkt.header.flags == KIT_FLAG_CLIENT_HANDSHAKE) {
+			slot = kit_get_slot();
+			if (slot < 0) {
+				kit_set_error(KIT_NO_MORE_SLOT);
+				goto fail;
+			}
+			if (!CreateTimerQueueTimer(&hTimer, NULL, (WAITORTIMERCALLBACK)kit_timeout, &timeout, KIT_DEFAULT_TIMEOUT, 0, WT_EXECUTEDEFAULT)) {
+				kit_set_error(KIT_TIMER_ERROR);
+				goto fail;
+			}
+			if (!kit_fill_secure_random(server_private, ECC_PRV_KEY_SIZE)) {
+				kit_set_error(KIT_KEY_GENERATION_FAILED);
+				goto fail;
+			}
+			if (!ecdh_generate_keys(server_public, server_private)) {
+				kit_set_error(KIT_KEY_GENERATION_FAILED);
+				goto fail;
+			}
+			if (!kit_make_packet(instance, KIT_TYPE_HANDSHAKE, KIT_DATA_BINARY, KIT_FLAG_SERVER_HANDSHAKE, ECC_PUB_KEY_SIZE, server_public, &pkt) || !kit_write_packet(instance, &pkt)) {
+				goto fail;
+			}
+			break;
+		}
+	}
+	while (KTRUE) {
+		if (timeout) {
+			goto fail;
+		}
+		if (!kit_read_packet(instance, &pkt)) {
+			goto fail;
 		}
 		if (pkt.header.type == KIT_TYPE_HANDSHAKE && pkt.header.flags == KIT_FLAG_CLIENT_HANDSHAKE) {
 			if (pkt.header.dataptr) {
 				memcpy(client_public, pkt.body.bindata, pkt.body.length);
 				if (!ecdh_shared_secret(server_private, client_public, shared_secret)) {
 					kit_set_error(KIT_SHARED_SECRET_GENERATION_FAILED);
-					return KFALSE;
+					goto fail;
 				}
-				if (hkdf(SHA1, NULL, 0, shared_secret, ECC_PUB_KEY_SIZE, KSALT, KSALT_LENGTH, instance->sharedSecret, SHA1HashSize) != 0) {
+				if (hkdf(SHA1, NULL, 0, shared_secret, ECC_PUB_KEY_SIZE, KSALT, KSALT_LENGTH, instance->sharedSecret[slot], SHA1HashSize) != 0) {
 					kit_set_error(KIT_KDF_FAILED);
-					return KFALSE;
+					goto fail;
 				}
-				if (!kit_make_packet(KIT_TYPE_ACCEPT, KIT_DATA_NONE, KIT_FLAG_ACCEPTED, 0, 0, &pkt) || !kit_write_packet(instance, &pkt)) {
-					return KFALSE;
+				if (!kit_make_packet(instance, KIT_TYPE_ACCEPT, KIT_DATA_NONE, KIT_FLAG_ACCEPTED, 0, 0, &pkt) || !kit_write_packet(instance, &pkt)) {
+					goto fail;
 				}
 				break;
 			}
 		}
 	}
 	while (KTRUE) {
+		if (timeout) {
+			goto fail;
+		}
 		if (!kit_read_packet(instance, &pkt)) {
-			return KFALSE;
+			goto fail;
 		}
 		if (pkt.header.type == KIT_TYPE_CONNECT && pkt.header.flags == KIT_FLAG_CONNECTED) {
-			return KTRUE;
+			if (slot > 0) {
+				kptr ptr = (kptr)((kuint64)instance->hMap + (instance->size * slot));
+				if (!VirtualAlloc(ptr, sizeof(kpacket), MEM_COMMIT, PAGE_READWRITE)) {
+					kit_free_slot(slot);
+					kit_set_error(KIT_MEMORY_RESIZE_ERROR);
+					goto fail;
+				}
+			}
+			if (!kit_make_packet(instance, KIT_TYPE_CONNECT, KIT_DATA_BINARY, KIT_FLAG_CONNECTED, sizeof(slot), &slot, &pkt) == KTRUE) {
+				kit_set_error(KIT_CONNECT_FAILED);
+				goto fail;
+			}
+			if (!kit_write_packet(instance, &pkt)) {
+				goto fail;
+			}
+			break;
 		}
 	}
+	while (KTRUE) {
+		if (timeout) {
+			goto fail;
+		}
+		if (!kit_read_packet(instance, &pkt)) {
+			goto fail;
+		}
+		if (pkt.header.type == KIT_TYPE_CONNECT && pkt.header.flags == KIT_FLAG_CONNECTED && pkt.body.datatype == KIT_DATA_BINARY) {
+			if (pkt.header.readed) {
+				if (!kit_make_packet(instance, KIT_TYPE_BIND, KIT_DATA_NONE, KIT_FLAG_BINDED, 0, 0, &pkt) == KTRUE) {
+					kit_set_error(KIT_BIND_FAILED);
+					goto fail;
+				}
+				if (!kit_write_packet(instance, &pkt)) {
+					goto fail;
+				}
+				break;
+			}
+		}
+	}
+	kit_set_error(KIT_OK);
+	if (!DeleteTimerQueueTimer(NULL, hTimer, NULL)) {
+		kit_set_error(KIT_TIMER_ERROR);
+		return KNULL;
+	}
+	info->clientid = slot;
+	info->instance.aes = instance->aes;
+	info->instance.hMap = (kptr)((kuint64)instance->hMap + (instance->size * info->clientid));
+	info->instance.hFile = instance->hFile;
+	info->instance.size = instance->size;
+	info->instance.id = instance->id;
+	info->instance.sharedSecret = (ksharedsecret*)malloc(sizeof(ksharedsecret));
+	memcpy(info->instance.sharedSecret, instance->sharedSecret[slot], sizeof(ksharedsecret));
+	return info;
+fail:
+	while (KTRUE) {
+		if (!kit_make_packet(instance, KIT_TYPE_BIND, KIT_DATA_NONE, KIT_FLAG_BINDED, 0, 0, &pkt) == KTRUE) {
+			kit_set_error(KIT_BIND_FAILED);
+		}
+		if (kit_write_packet(instance, &pkt)) {
+			break;
+		}
+	}
+	free(info);
+	kit_free_slot(slot);
+	if (hTimer) {
+		if (!DeleteTimerQueueTimer(NULL, hTimer, NULL)) {
+			kit_set_error(KIT_TIMER_ERROR);
+			return KNULL;
+		}
+		if (timeout) {
+			kit_set_error(KIT_TIMEOUT_ERROR);
+		}
+	}
+	return KNULL;
 }
 
 kbool kit_fill_secure_random(IN kptr buffer, IN ksize size) {
@@ -1918,8 +2106,8 @@ kcstring kit_human_error() {
 		return "connection failed invalid shared memory name";
 	case KIT_MEMORY_READ_ERROR:
 		return "unable to read memory";
-	case KIT_SERVER_NOT_AVAILABLE:
-		return "error server not ready";
+	case KIT_TIMEOUT_ERROR:
+		return "error timeout";
 	case KIT_KEY_GENERATION_FAILED:
 		return "key generation failed";
 	case KIT_PACKET_MISMATCH_CRC32:
@@ -1932,6 +2120,12 @@ kcstring kit_human_error() {
 		return "error initialize failed";
 	case KIT_CRYPTO_ERROR:
 		return "error during crypto initialize/finalize";
+	case KIT_MEMORY_RESIZE_ERROR:
+		return "unable to resize mapped memory";
+	case KIT_TIMER_ERROR:
+		return "error during create / delete timer";
+	case KIT_NO_MORE_SLOT:
+		return "unable to accept more clients";
 	default:
 		return "unknown error";
 	}
@@ -1961,7 +2155,7 @@ kvoid kit_encrypt_packet(IN pkinstance instance, IN pkpacket pkt) {
 	switch (mutex_status) {
 	case WAIT_OBJECT_0:
 		kit_fill_secure_random(randomIV, sizeof(randomIV));
-		AES_init_ctx_iv(&instance->aes, instance->sharedSecret, randomIV);
+		AES_init_ctx_iv(&instance->aes, (kuint8*)instance->sharedSecret, randomIV);
 		padded_size = AES_pkcs7_pad_size(pkt->body.length);
 		padded = AES_pkcs7_pad(pkt->body.bindata, pkt->body.length);
 		memcpy(pkt->body.bindata, randomIV, sizeof(randomIV));
@@ -1985,7 +2179,7 @@ kvoid kit_decrypt_packet(IN pkinstance instance, IN pkpacket pkt) {
 	switch (mutex_status) {
 	case WAIT_OBJECT_0:
 		memcpy(randomIV, pkt->body.bindata, sizeof(randomIV));
-		AES_init_ctx_iv(&instance->aes, instance->sharedSecret, randomIV);
+		AES_init_ctx_iv(&instance->aes, (kuint8*)instance->sharedSecret, randomIV);
 		AES_CBC_decrypt_buffer(&instance->aes, pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
 		unpadded_size = AES_pkcs7_unpad_size(pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
 		unpadded = AES_pkcs7_unpad(pkt->body.bindata + sizeof(randomIV), pkt->body.length - sizeof(randomIV));
@@ -2016,7 +2210,7 @@ kbool kit_write(IN pkinstance instance, IN kbinary* data, ksize length) {
 			}
 		}
 	}
-	if (!kit_make_packet(KIT_TYPE_DATA, KIT_DATA_BINARY, KIT_FLAG_DEFAULT, length, data, &pkt)) {
+	if (!kit_make_packet(instance, KIT_TYPE_DATA, KIT_DATA_BINARY, KIT_FLAG_DEFAULT, length, data, &pkt)) {
 		return KFALSE;
 	}
 	kit_encrypt_packet(instance, &pkt);
@@ -2039,8 +2233,8 @@ pkpacket kit_read(IN pkinstance instance) {
 				if (pkt->header.type == KIT_TYPE_DATA && pkt->header.flags == KIT_FLAG_DEFAULT && pkt->body.datatype == KIT_DATA_BINARY) {
 					kit_decrypt_packet(instance, pkt);
 				}
-				if (!pkt->header.readed && pkt->header.pid != kit_last_pid) {
-					kit_last_pid = pkt->header.pid;
+				if (!pkt->header.readed && pkt->header.senderid != instance->id) {
+					//kit_last_pid = pkt->header.pid;
 					kit_set_read(instance);
 					break;
 				}
@@ -2055,7 +2249,7 @@ pkpacket kit_read(IN pkinstance instance) {
 
 kbool kit_disconnect(IN pkinstance instance) {
 	kpacket pkt;
-	if (!kit_make_packet(KIT_TYPE_DISCONNECT, KIT_DATA_NONE, KIT_FLAG_DISCONNECTED, 0, KNULL, &pkt) || !kit_write_packet(instance, &pkt)) {
+	if (!kit_make_packet(instance, KIT_TYPE_DISCONNECT, KIT_DATA_NONE, KIT_FLAG_DISCONNECTED, 0, KNULL, &pkt) || !kit_write_packet(instance, &pkt)) {
 		return KFALSE;
 	}
 	return KTRUE;
@@ -2078,15 +2272,13 @@ kvoid kit_set_read(IN pkinstance instance) {
 kit_action kit_select(IN pkinstance instance) {
 	kpacket pkt;
 	if (kit_read_packet(instance, &pkt)) {
-		if (!pkt.header.readed && pkt.header.pid != kit_last_pid) {
+		if (!pkt.header.readed && pkt.header.senderid != instance->id) {
 			return KIT_CAN_READ;
 		}
-		else if (pkt.header.readed && pkt.header.pid != kit_last_pid) {
+		else if (pkt.header.readed && pkt.header.senderid != instance->id) {
 			return KIT_CAN_WRITE;
 		}
 	}
-	else {
-		return KIT_WAIT;
-	}
+	return KIT_WAIT;
 }
 #endif

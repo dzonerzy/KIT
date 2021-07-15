@@ -11,6 +11,7 @@ Keep In Touch - C single header library for IPC
  - Easy to use API
  - Small footprint
  - Process safe & Thread safe
+ - Multi client support
 
 # Protocol format ( *kpacket* )
 
@@ -36,7 +37,7 @@ Inside the header we can find:
  - Packet Flags [\*](#header---packet-type-and-flags)
  - Packet Type [\*](#header---packet-type-and-flags)
  - Checksum (crc32)
- - PID (Packet ID)
+ - Sender ID
  - Data pointer (pointer to the body)
  - Readed (flag which indicate if the packet was readed)
 
@@ -73,9 +74,11 @@ SAFEAPI kbool kit_disconnect(IN pkinstance instance);
 SAFEAPI pkpacket kit_read(IN pkinstance instance);
 SAFEAPI kbool kit_write(IN pkinstance instance, IN kbinary* data, ksize length);
 SAFEAPI kbool kit_connect(IN kcstring id, OUT pkinstance instance);
-SAFEAPI kbool kit_listen_and_accept(IN pkinstance instance);
+SAFEAPI pkclientinfo kit_listen_and_accept(IN pkinstance instance);
 SAFEAPI kuint32 kit_get_error();
 SAFEAPI kcstring kit_human_error();
+SAFEAPI kvoid kit_notify_disconnect(pkclientinfo clientinfo);
+SAFEAPI kbool kit_is_disconnect(pkpacket pkt);
 ```
 
 ## Unsafe API
@@ -89,10 +92,13 @@ UNSAFEAPI kvoid kit_encrypt_packet(IN pkinstance instance, IN pkpacket pkt);
 UNSAFEAPI kbool kit_client_handshake(IN pkinstance instance);
 UNSAFEAPI kbool kit_read_packet(IN pkinstance instance, OUT pkpacket pkt);
 UNSAFEAPI kbool kit_write_packet(IN pkinstance instance, IN pkpacket packet);
-UNSAFEAPI kbool kit_make_packet(IN kit_packet_type ptype, IN kit_data_type dtype, IN kit_packet_flags flags, IN ksize datasize, IN kptr data, OUT pkpacket packet);
+UNSAFEAPI kbool kit_make_packet(IN pkinstance instance, IN kit_packet_type ptype, IN kit_data_type dtype, IN kit_packet_flags flags, IN ksize datasize, IN kptr data, OUT pkpacket packet);
 UNSAFEAPI kvoid kit_set_error(IN kit_error errid);
 UNSAFEAPI kuint32 kit_crc32(IN kptr data, IN ksize datasize);
 UNSAFEAPI kbool kit_fill_secure_random(IN kptr buffer, IN ksize size);
+UNSAFEAPI kvoid kit_timeout(IN PVOID lpParameter, IN BOOLEAN TimerOrWaitFired);
+UNSAFEAPI kuint8 kit_get_slot();
+UNSAFEAPI kvoid kit_free_slot(kuint8 slot);
 ```
 
 # Server example
@@ -103,23 +109,46 @@ Starting a KIT server is easy as:
 #include <kit.h>
 #include <stdio.h>
 
-int main() {
-  // First initialize KIT
-  if (kit_init()) {
-    // Declare a KIT instance this struct hold all the needed information for KIT to works
-    kinstance instance = {0};
-    if(kit_bind(KIT_DEFAULT_ID, &instance)) {
-      if(kit_listen_and_accept(&instance)) {
-        // Got a connection
-        // Now you can use kit_select or kit_read / kit_write
-      }else{
-        printf("kit_listen_and_accept error: %s\n", kit_human_error());
+void handle(pkclientinfo info) {
+  while (KTRUE) {
+    pkpacket pkt = kit_read(&info->instance);
+    if (!pkt) {
+      return;
+    } else {
+      if (kit_is_disconnect(pkt)) {
+        printf("client %d disconnected\n", info->clientid);
+        kit_notify_disconnect(info);
+        break;
+      } else {
+        printf("Server got message: %s from client: %d\n", pkt->body.strdata, pkt->header.senderid);
+        free(pkt);
       }
-    }else{
-      printf("kit_bind error: %s\n", kit_human_error());
     }
   }
 }
+
+int main() {
+  kinstance instance;
+  if (kit_init()) {
+    if (kit_bind(KIT_DEFAULT_ID, &instance)) {
+      printf("listening...\n");
+      while (KTRUE) {
+        pkclientinfo client = kit_listen_and_accept(&instance);
+        if (client) {
+          if (client -> clientid > 0) {
+            printf("client '%d' connected!\n", client->clientid);
+            CreateThread(0, 0, (LPTHREAD_START_ROUTINE) handle, client, 0, 0);
+          }
+        } else {
+          printf("kit_listen_and_accept: %s\n", kit_human_error());
+        }
+      }
+    } else {
+      printf("kit_bind: %s\n", kit_human_error());
+    }
+  }
+}
+
 ```
 
 # Client example
@@ -131,23 +160,22 @@ Connecting to a KIT server is easy as:
 #include <stdio.h>
 
 int main() {
-  // First initialize KIT
+  kinstance instance;
   if (kit_init()) {
-    // Declare a KIT instance this struct hold all the needed information for KIT to works
-    kinstance instance = {0};
-    // Use the same ID used on server side
-    if(kit_connect(KIT_DEFAULT_ID, &instance)) {
-      // Now you can use kit_select or kit_read / kit_write
-      if(kit_disconnect(&instance)) {
-        printf("Client disconnected!\n");
-        return 0;
-      }else{
-        printf("kit_disconnect error: %s\n", kit_human_error());
+    if (kit_connect(KIT_DEFAULT_ID, &instance)) {
+      for (int i = 0; i < 5; i++) {
+        char * msg = "Hello World!";
+        if (!kit_write(&instance, msg, strlen(msg))) {
+          return;
+        }
+        Sleep(1500);
       }
-    }else{
-      printf("kit_connect error: %s\n", kit_human_error());
+      kit_disconnect( & instance);
+    } else {
+      printf("kit_connect: %s\n", kit_human_error());
     }
   }
+  return;
 }
 ```
 
